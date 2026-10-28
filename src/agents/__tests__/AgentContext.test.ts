@@ -1,5 +1,6 @@
 // src/agents/__tests__/AgentContext.test.ts
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
+import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { markTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
 import { buildSummaryCarrierText } from '@/summarization/shared';
@@ -51,6 +52,44 @@ describe('AgentContext', () => {
       invoke: jest.fn(),
       schema: { type: 'object', properties: {} },
     }) as unknown as t.GenericTool;
+
+  describe('fromConfig — providerReasoningReplay', () => {
+    const replayContext = (
+      provider: Providers,
+      providerReasoningReplay?: boolean
+    ): AgentContext =>
+      createBasicContext({
+        agentConfig: {
+          provider,
+          providerReasoningReplay,
+          clientOptions: { model: 'test-model' } as t.ClientOptions,
+        },
+      });
+
+    it('asks Anthropic to drop mismatched thinking blocks and Bedrock to retry without reasoning', () => {
+      const anthropic = replayContext(Providers.ANTHROPIC, true);
+      const bedrock = replayContext(Providers.BEDROCK, true);
+
+      expect(anthropic.providerReasoningReplay).toBe(true);
+      expect(anthropic.clientOptions).toMatchObject({
+        model: 'test-model',
+        dropMismatchedThinkingBlocks: true,
+      });
+      expect(bedrock.clientOptions).toMatchObject({
+        retryWithoutReasoningOnRejection: true,
+      });
+    });
+
+    it('leaves client options alone without the option or for other providers', () => {
+      expect(replayContext(Providers.ANTHROPIC).providerReasoningReplay).toBe(false);
+      expect(replayContext(Providers.ANTHROPIC).clientOptions).toEqual({
+        model: 'test-model',
+      });
+      expect(replayContext(Providers.OPENAI, true).clientOptions).toEqual({
+        model: 'test-model',
+      });
+    });
+  });
 
   describe('fromConfig — host-supplied graphTools', () => {
     it('copies graphTools onto the context without aliasing the host array', () => {
@@ -329,7 +368,7 @@ describe('AgentContext', () => {
       );
     });
 
-    it('places the Bedrock cache point before dynamic system text', async () => {
+    it('moves the dynamic Bedrock text out of the system message', async () => {
       const ctx = createBasicContext({
         agentConfig: {
           provider: Providers.BEDROCK,
@@ -347,8 +386,165 @@ describe('AgentContext', () => {
       expect(content).toEqual([
         { type: 'text', text: 'Stable instructions' },
         { cachePoint: { type: 'default', ttl: '1h' } },
-        { type: 'text', text: 'Dynamic instructions' },
       ]);
+      expect(result[1].content).toBe('Dynamic instructions');
+    });
+
+    it('keeps the Bedrock history ahead of the moved tail and marks both ends of it', async () => {
+      const build = (dynamic: string): AgentContext =>
+        createBasicContext({
+          agentConfig: {
+            provider: Providers.BEDROCK,
+            clientOptions: {
+              model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
+              promptCache: true,
+            },
+            instructions: 'Stable instructions',
+            additional_instructions: dynamic,
+          },
+        });
+      const history = (): BaseMessage[] => [
+        new HumanMessage('Q1'),
+        new AIMessage('A1'),
+        new HumanMessage('Q2'),
+      ];
+      const first = await build('Tail one').systemRunnable!.invoke(history());
+      const second = await build('Tail two').systemRunnable!.invoke(history());
+      const point = { cachePoint: { type: 'default', ttl: '1h' } };
+
+      expect(first.slice(1).map((message) => message.content)).toEqual([
+        'Q1',
+        [{ type: 'text', text: 'A1' }, point],
+        'Tail one',
+        [{ type: 'text', text: 'Q2' }, point],
+      ]);
+      expect(JSON.stringify(second.slice(0, 3))).toBe(
+        JSON.stringify(first.slice(0, 3))
+      );
+    });
+
+    describe('conversation_instructions', () => {
+      const breakpoint = { type: 'ephemeral', ttl: '1h' };
+      const bedrockOptions = {
+        model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
+        promptCache: true,
+      };
+      const createConversationContext = (
+        agentConfig: Partial<t.AgentInputs>
+      ): AgentContext =>
+        createBasicContext({
+          agentConfig: {
+            instructions: 'Stable instructions',
+            conversation_instructions: 'Conversation context',
+            ...agentConfig,
+          },
+        });
+
+      it.each([Providers.ANTHROPIC, Providers.OPENROUTER])(
+        'keeps the %s conversation block behind the stable one and moves only the dynamic tail',
+        async (provider) => {
+          const ctx = createConversationContext({
+            provider,
+            clientOptions: { model: 'claude-sonnet-4-5', promptCache: true },
+            additional_instructions: 'Per-turn context',
+          });
+
+          const result = await ctx.systemRunnable!.invoke([
+            new HumanMessage('Second'),
+          ]);
+
+          expect(result[0].content).toEqual([
+            { type: 'text', text: 'Stable instructions', cache_control: breakpoint },
+            { type: 'text', text: 'Conversation context', cache_control: breakpoint },
+          ]);
+          expect(result.slice(1).map((m) => m.content)).toContain('Per-turn context');
+          expect(JSON.stringify(result).match(/"cache_control"/g)!.length).toBeLessThanOrEqual(3);
+        }
+      );
+
+      it.each([Providers.ANTHROPIC, Providers.OPENROUTER])(
+        'leaves the %s conversation block unmarked when tools, stable text and two body blocks use all four',
+        async (provider) => {
+          const build = (additional?: string): AgentContext =>
+            createConversationContext({
+              provider,
+              clientOptions: { model: 'claude-sonnet-4-5', promptCache: true },
+              additional_instructions: additional,
+            });
+          const conversationMarked = (messages: BaseMessage[]): boolean =>
+            JSON.stringify(messages[0].content).includes(
+              '"Conversation context","cache_control"'
+            );
+          const markers = (messages: BaseMessage[]): number =>
+            JSON.stringify(messages).match(/"cache_control"/g)?.length ?? 0;
+
+          /** The moved tail puts one marker before it and one on the last message. */
+          const history = await build('Per-turn context').systemRunnable!.invoke([
+            new HumanMessage('Q1'),
+            new AIMessage('A1'),
+            new HumanMessage('Q2'),
+          ]);
+          const twoBlocks = await build().systemRunnable!.invoke([
+            new HumanMessage({
+              content: [
+                { type: 'text', text: 'One', cache_control: breakpoint },
+                { type: 'text', text: 'Two', cache_control: breakpoint },
+              ],
+            }),
+          ]);
+
+          expect(conversationMarked(history)).toBe(false);
+          expect(markers(history)).toBe(3);
+          expect(conversationMarked(twoBlocks)).toBe(false);
+          expect(markers(twoBlocks)).toBe(3);
+        }
+      );
+
+      it('gives the Bedrock conversation block a cache point only while one of four is left', async () => {
+        const ctx = createConversationContext({
+          provider: Providers.BEDROCK,
+          clientOptions: bedrockOptions,
+          additional_instructions: 'Per-turn context',
+        });
+        const count = (messages: BaseMessage[]): number =>
+          JSON.stringify(messages).match(/"cachePoint"/g)?.length ?? 0;
+
+        const short = await ctx.systemRunnable!.invoke([new HumanMessage('Q1')]);
+        const long = await ctx.systemRunnable!.invoke([
+          new HumanMessage('Q1'),
+          new AIMessage('A1'),
+          new HumanMessage('Q2'),
+        ]);
+
+        /** The tools take the fourth one when the request is built. */
+        expect(count(short)).toBe(3);
+        expect(count(long)).toBe(3);
+        expect(JSON.stringify(short[0].content)).toContain(
+          'Conversation context"},{"cachePoint'
+        );
+        expect(JSON.stringify(long[0].content)).not.toContain(
+          'Conversation context"},{"cachePoint'
+        );
+      });
+
+      it('sends a compaction summary and an initial summary as the same first message', async () => {
+        const compacted = createConversationContext({});
+        compacted.setSummary('Checkpoint', 13);
+        const restored = createConversationContext({});
+        restored.setInitialSummary('Checkpoint', 13);
+        const messages = (): BaseMessage[] => [new HumanMessage('Next')];
+
+        const fromCompaction = await compacted.systemRunnable!.invoke(messages());
+        const fromRestore = await restored.systemRunnable!.invoke(messages());
+
+        expect(fromCompaction[1].content).toBe(
+          buildSummaryCarrierText('Checkpoint')
+        );
+        expect(fromRestore).toEqual(fromCompaction);
+        expect(fromRestore[0].content).toBe(
+          'Stable instructions\n\nConversation context'
+        );
+      });
     });
 
     it('uses plain Bedrock system text when only dynamic system text exists', async () => {
@@ -1030,7 +1226,6 @@ describe('AgentContext', () => {
       expect(finalMessages[0].content).toEqual([
         { type: 'text', text: 'Stable instructions' },
         { cachePoint: { type: 'default', ttl: '1h' } },
-        { type: 'text', text: 'Dynamic instructions' },
       ]);
     });
   });
@@ -3253,6 +3448,57 @@ describe('AgentContext', () => {
       ctx.projectContextUsage([new HumanMessage('hi') as unknown as AIMessage]);
 
       expect(ctx.systemMessageTokens).toBeGreaterThan(systemBefore);
+    });
+  });
+
+  describe('toolDispatch', () => {
+    const boundNames = (ctx: AgentContext): string[] =>
+      (ctx.getToolsForBinding() ?? []).map((tool) =>
+        'name' in tool ? String(tool.name) : ''
+      );
+    const toolDefinitions: t.LCTool[] = [
+      { name: 'bound_tool' },
+      { name: 'late_tool', defer_loading: true },
+    ];
+
+    it('binds call_tool after the other tools and leaves deferred tools unbound', () => {
+      const ctx = createBasicContext({
+        agentConfig: { toolDefinitions, toolDispatch: true },
+      });
+      expect(boundNames(ctx)).toEqual(['bound_tool', 'call_tool']);
+    });
+
+    it('keeps a discovered deferred tool unbound with the dispatcher, bound without it', () => {
+      const bound = (toolDispatch: boolean): string[] => {
+        const ctx = createBasicContext({
+          agentConfig: { toolDefinitions, toolDispatch: toolDispatch || undefined },
+        });
+        ctx.markToolsAsDiscovered(['late_tool']);
+        return boundNames(ctx);
+      };
+      expect(bound(true)).toEqual(['bound_tool', 'call_tool']);
+      expect(bound(false)).toEqual(['bound_tool', 'late_tool']);
+    });
+
+    it('binds no dispatcher unless the host opts in', () => {
+      const ctx = createBasicContext({ agentConfig: { toolDefinitions } });
+      expect(boundNames(ctx)).toEqual(['bound_tool']);
+    });
+
+    it('counts the dispatcher schema with the other tool schemas', async () => {
+      const tokenCounter = (message: { content: unknown }): number =>
+        String(message.content).includes('call_tool') ? 100 : 1;
+      const toolTokens = async (toolDispatch?: boolean): Promise<number> => {
+        const ctx = createBasicContext({
+          agentConfig: { toolDefinitions, toolDispatch },
+        });
+        await ctx.calculateInstructionTokens(
+          tokenCounter as unknown as t.TokenCounter
+        );
+        return ctx.toolSchemaTokens;
+      };
+
+      expect((await toolTokens(true)) - (await toolTokens())).toBeGreaterThanOrEqual(100);
     });
   });
 });

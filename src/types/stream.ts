@@ -9,6 +9,7 @@ import type {
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { LLMResult, Generation } from '@langchain/core/outputs';
 import type { Command } from '@langchain/langgraph';
+import type { OpenAI as OpenAIClient } from 'openai';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { AnthropicContentBlock } from '@/llm/anthropic/types';
 import type { AssistantTextPhase } from '@/types/assistantPhase';
@@ -111,6 +112,8 @@ export type RunStep = {
   groupId?: number; // #new
   index: number; // #new
   stepIndex?: number; // #new
+  /** Tool-calls steps only: shared by the calls of one model response. */
+  roundId?: string;
   stepDetails: StepDetails;
   summary?: SummaryContentBlock;
   usage?: null | object;
@@ -234,12 +237,28 @@ export type ToolEndCallback = (
   metadata?: Record<string, unknown>
 ) => Promise<void>;
 
+/** Target of a dispatcher call, as executed. */
+export type DispatchedToolCall = {
+  name: string;
+  args: string | Record<string, unknown>;
+};
+
 export type ProcessedToolCall = {
   name: string;
   args: string | Record<string, unknown>;
   id: string;
+  /** Output reference key (`tool<i>turn<n>`), see `ToolMessageRefMetadata._refKey`. */
+  ref?: string;
+  /** Placeholder keys that did not resolve for this call. */
+  unresolved_refs?: string[];
   output: string;
   progress: number;
+  /**
+   * The tool that actually ran when `name` is the dispatcher tool. The call
+   * keeps the model's form (`name`/`args` of the dispatcher call) so stored
+   * history stays valid; renderers should key on this field when present.
+   */
+  dispatched?: DispatchedToolCall;
   /**
    * Settled label for the call, resolved from the tool-supplied
    * `outcome`/`outcome_patch` result fields against the model-authored
@@ -253,7 +272,12 @@ export type ProcessedToolCall = {
    * which is language-neutral and always consistent.
    */
   outcome?: string;
+  /** Set when `output` is the JSON of the content blocks the tool returned. */
+  outputFormat?: ToolOutputFormat;
 };
+
+/** `blocks`: the tool returned content blocks, stored as their JSON in `output`. */
+export type ToolOutputFormat = 'blocks';
 
 export type ProcessedContent = {
   type: ContentType;
@@ -402,7 +426,43 @@ export type MessageDeltaUpdate = {
   /** Provider-supplied source citations, accumulated across deltas. */
   citations?: Anthropic.TextCitation[];
 };
-export type ReasoningDeltaUpdate = { type: ContentTypes.THINK; think: string };
+export type BedrockReasoningReplayBlock = {
+  type: ContentTypes.REASONING_CONTENT;
+  reasoningText?: { text?: string; signature?: string };
+  redactedContent?: string;
+};
+
+export type AnthropicReasoningReplayBlock =
+  | {
+      type: ContentTypes.THINKING;
+      thinking?: string;
+      signature?: string;
+    }
+  | {
+      type: 'redacted_thinking';
+      data: string;
+    };
+
+export type AnthropicReasoningReplay = {
+  model: string;
+  blocks: AnthropicReasoningReplayBlock[];
+};
+
+export type BedrockReasoningReplay = {
+  model: string;
+  blocks: BedrockReasoningReplayBlock[];
+};
+
+export type ProviderReasoningReplay = {
+  anthropic?: AnthropicReasoningReplay;
+  bedrock?: BedrockReasoningReplay;
+};
+
+export type ReasoningDeltaUpdate = {
+  type: ContentTypes.THINK;
+  think: string;
+  provider_replay?: ProviderReasoningReplay;
+};
 
 export type ContentType =
   | 'text'
@@ -415,6 +475,7 @@ export type ContentType =
 export type ReasoningContentText = {
   type: ContentTypes.THINK;
   think: string;
+  provider_replay?: ProviderReasoningReplay;
 };
 
 export type SummaryBoundary = {
@@ -491,14 +552,56 @@ export type ToolCallPart = {
   /** If provided, the output of the tool call */
   output?: ToolResultContent['content'];
   /**
+   * Output reference key and unresolved placeholders (see
+   * `ProcessedToolCall.ref`), persisted so a restored history re-creates
+   * the same `[ref: …]` labels the live run showed the model.
+   */
+  ref?: string;
+  unresolved_refs?: string[];
+  /**
    * Tool-authored settled label for the call (see `ProcessedToolCall.outcome`),
    * preserved through aggregation so it survives persistence/reload.
    */
   outcome?: string;
+  /** Tool that ran when `name` is the dispatcher tool (see `ProcessedToolCall.dispatched`). */
+  dispatched?: DispatchedToolCall;
   /** Auth URL */
   auth?: string;
   /** Expiration time */
   expires_at?: number;
+  /**
+   * Model response that issued the call (`RunStep.roundId`). Calls sharing it
+   * replay as one assistant message; a change starts the next tool round.
+   */
+  roundId?: string;
+  /** See `ProcessedToolCall.outputFormat`; restored as the same content blocks. */
+  outputFormat?: ToolOutputFormat;
+  /**
+   * OpenAI Responses output items of the model response, from the item after
+   * the previous call through this call's `function_call` (the last call also
+   * carries any trailing items). Replayed verbatim on restore so the tool
+   * round serializes as the live request did.
+   */
+  providerItems?: ProviderOutputItems;
+};
+
+/**
+ * Provider output items persisted on a tool call part. Restore replays only
+ * `reasoning`, `function_call`, and `message` items within a size cap, and
+ * only to the origin that produced them; hosts must still treat stored items
+ * as data they wrote, not as input from users.
+ */
+export type ProviderOutputItems = {
+  /** Opaque digest of the model and endpoint; replay only goes back to it. */
+  origin: string;
+  /** Response creation time, epoch seconds. */
+  created_at?: number;
+  items: OpenAIClient.Responses.ResponseOutputItem[];
+};
+
+/** Registry-only event: output items of a tool round, keyed by tool call. */
+export type ProviderOutputItemsEvent = {
+  tool_calls: Array<{ id: string; providerItems: ProviderOutputItems }>;
 };
 
 export type ToolCallContent = {
@@ -573,6 +676,7 @@ export type ContentAggregator = ({
     | MessageDeltaEvent
     | ReasoningDeltaEvent
     | RunStepDeltaEvent
+    | ProviderOutputItemsEvent
     | SummarizeDeltaData
     | SummarizeCompleteEvent
     | { result: ToolEndEvent };

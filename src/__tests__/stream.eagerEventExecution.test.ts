@@ -2137,6 +2137,130 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(messageDeltas[0]?.delta).toEqual({ content: [toolCallPart] });
   });
 
+  describe('provider reasoning capture', () => {
+    const capture = async (
+      agentContext: Partial<AgentContext>,
+      content: t.MessageContentComplex[],
+      metadata: Record<string, unknown> = {}
+    ): Promise<t.ProviderReasoningReplay | undefined> => {
+      const dispatchReasoningDelta = jest.fn<
+        StandardGraph['dispatchReasoningDelta']
+      >(async () => undefined);
+      const graph = createGraph({
+        dispatchReasoningDelta,
+        getAgentContext: jest.fn(
+          (): Partial<AgentContext> => ({
+            provider: Providers.ANTHROPIC,
+            reasoningKey: 'reasoning',
+            currentTokenType: ContentTypes.THINK,
+            toolDefinitions: [],
+            graphTools: [],
+            agentId: 'agent_1',
+            ...agentContext,
+          })
+        ) as unknown as StandardGraph['getAgentContext'],
+      });
+      await new ChatModelStreamHandler().handle(
+        GraphEvents.CHAT_MODEL_STREAM,
+        { chunk: { content } as unknown as t.StreamChunk },
+        { langgraph_node: 'agent', ...metadata },
+        graph
+      );
+      const delta = dispatchReasoningDelta.mock.calls[0]?.[1] as
+        | { content: Array<{ provider_replay?: t.ProviderReasoningReplay }> }
+        | undefined;
+      return delta?.content[0]?.provider_replay;
+    };
+    const optedIn = {
+      providerReasoningReplay: true,
+      clientOptions: { model: 'claude-primary' },
+    };
+    const signed = [
+      { type: ContentTypes.THINKING, thinking: 'thought', signature: 'sig' },
+    ] satisfies t.MessageContentComplex[];
+
+    it('captures nothing unless the agent opted in', async () => {
+      expect(
+        await capture({ clientOptions: { model: 'claude-primary' } }, signed)
+      ).toBeUndefined();
+    });
+
+    it('captures Anthropic thinking, signature-only and redacted parts', async () => {
+      const blocksOf = async (part: t.MessageContentComplex) =>
+        (await capture(optedIn, [part]))?.anthropic;
+
+      expect(
+        await blocksOf({ type: ContentTypes.THINKING, thinking: 'thought' })
+      ).toEqual({
+        model: 'claude-primary',
+        blocks: [{ type: ContentTypes.THINKING, thinking: 'thought' }],
+      });
+      expect((await blocksOf({ type: ContentTypes.THINKING, signature: 'sig' }))?.blocks).toEqual([
+        { type: ContentTypes.THINKING, signature: 'sig' },
+      ]);
+      expect((await blocksOf({ type: 'redacted_thinking', data: 'opaque' }))?.blocks).toEqual([
+        { type: 'redacted_thinking', data: 'opaque' },
+      ]);
+    });
+
+    it('captures signed reasoning normalized by inherited stream events', async () => {
+      const replay = await capture(optedIn, [
+        { type: ContentTypes.REASONING, reasoning: 'thought', signature: 'sig' },
+      ]);
+      expect(replay?.anthropic?.blocks).toEqual([
+        { type: ContentTypes.THINKING, thinking: 'thought', signature: 'sig' },
+      ]);
+    });
+
+    it('captures Bedrock signed and redacted reasoning', async () => {
+      const bedrock = { providerReasoningReplay: true, provider: Providers.BEDROCK };
+      const model = 'anthropic.claude-sonnet-5-v1:0';
+      expect(
+        (
+          await capture({ ...bedrock, clientOptions: { model } }, [
+            {
+              type: ContentTypes.REASONING_CONTENT,
+              reasoningText: { text: 'thought', signature: 'sig' },
+            },
+          ])
+        )?.bedrock
+      ).toEqual({
+        model,
+        blocks: [
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            reasoningText: { text: 'thought', signature: 'sig' },
+          },
+        ],
+      });
+      expect(
+        (
+          await capture({ ...bedrock, clientOptions: { model } }, [
+            { type: ContentTypes.REASONING_CONTENT, redactedContent: 'opaque' },
+          ])
+        )?.bedrock?.blocks
+      ).toEqual([{ type: ContentTypes.REASONING_CONTENT, redactedContent: 'opaque' }]);
+    });
+
+    it('reads the model from the modelName alias', async () => {
+      const replay = await capture(
+        {
+          providerReasoningReplay: true,
+          clientOptions: { modelName: 'claude-alias' } as t.ClientOptions,
+        },
+        signed
+      );
+      expect(replay?.anthropic?.model).toBe('claude-alias');
+    });
+
+    it('attributes the blocks to the fallback that served the call', async () => {
+      const replay = await capture(optedIn, signed, {
+        [Constants.INVOKED_MODEL]: 'claude-fallback',
+      });
+      expect(replay?.anthropic?.model).toBe('claude-fallback');
+    });
+  });
+
   it('dispatches Gemini server-side tool context when reasoning is present', async () => {
     const dispatchMessageDelta = jest.fn<StandardGraph['dispatchMessageDelta']>(
       async () => undefined
@@ -5340,6 +5464,46 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
 
     expect(toolExecuteCalls).toHaveLength(0);
     expect(graph.eagerEventToolExecutions.has('call_cf2')).toBe(false);
+  });
+
+  it('does not prestart dispatcher calls', async () => {
+    const graph = createGraph({
+      eagerEventToolExecution: { enabled: true },
+      getAgentContext: jest.fn(() => ({
+        provider: Providers.ANTHROPIC,
+        reasoningKey: 'reasoning',
+        toolDefinitions: [{ name: 'call_tool' }],
+        toolDispatch: true,
+        agentId: 'agent_1',
+      })) as unknown as StandardGraph['getAgentContext'],
+    });
+    const toolExecute = jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockResolvedValue(undefined);
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_dispatch',
+              name: 'call_tool',
+              args: { name: 'late_tool', arguments: '{"query":"x"}' },
+            },
+          ],
+          response_metadata: finalToolCallResponseMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    expect(
+      toolExecute.mock.calls.some(([event]) => event === GraphEvents.ON_TOOL_EXECUTE)
+    ).toBe(false);
+    expect(graph.eagerEventToolExecutions.size).toBe(0);
   });
 
   it('keeps the direct-tool batch guard when an excluded tool is also direct', async () => {

@@ -1,8 +1,97 @@
+import {
+  OPENAI_RESPONSES_ORIGIN_KEY,
+  gateResponsesProviderOutput,
+} from './responsesToolRounds';
 import { HumanMessage, AIMessage, ToolMessage } from '@langchain/core/messages';
 import type { TPayload } from '@/types';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
+import { annotateMessagesForLLM, ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { formatAgentMessages } from './format';
-import { Constants, ContentTypes } from '@/common';
+import { createContentAggregator } from '@/stream';
+import { Constants, ContentTypes, GraphEvents } from '@/common';
+
+describe('formatAgentMessages tool output reference labels', () => {
+  it('restores the stored key and unresolved refs, labelled as live', () => {
+    const payload: TPayload = [
+      { role: 'user', content: 'go' },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'c1',
+              name: 'echo',
+              args: '{}',
+              output: 'bad',
+              ref: 'tool1turn3',
+              unresolved_refs: ['tool0turn0'],
+            },
+          },
+        ],
+      },
+    ];
+
+    const { messages } = formatAgentMessages(payload);
+    const restored = messages.find((m) => m instanceof ToolMessage)!;
+    const [wire] = annotateMessagesForLLM(
+      [restored],
+      new ToolOutputReferenceRegistry()
+    );
+
+    expect(restored.additional_kwargs).toMatchObject({
+      _refKey: 'tool1turn3',
+      _unresolvedRefs: ['tool0turn0'],
+    });
+    expect(wire.content).toBe(
+      '[ref: tool1turn3]\nbad\n[unresolved refs: tool0turn0]'
+    );
+    const call = (messages.find((m) => m instanceof AIMessage) as AIMessage)
+      .tool_calls?.[0];
+    expect(call).not.toHaveProperty('ref');
+  });
+
+  it('keeps the labels the content aggregator stored with the result', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: {
+        id: 'step_1',
+        stepIndex: 0,
+        index: 0,
+        type: 'tool_calls',
+        stepDetails: {
+          type: 'tool_calls',
+          tool_calls: [{ id: 'c1', name: 'echo', args: '{}' }],
+        },
+        usage: null,
+      } as never,
+    });
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP_COMPLETED,
+      data: {
+        result: {
+          id: 'step_1',
+          index: 0,
+          type: 'tool_call',
+          tool_call: {
+            id: 'c1',
+            name: 'echo',
+            args: '{}',
+            output: 'out',
+            progress: 1,
+            ref: 'tool0turn2',
+            unresolved_refs: ['tool0turn9'],
+          },
+        },
+      } as never,
+    });
+
+    expect(contentParts[0]).toMatchObject({
+      tool_call: { ref: 'tool0turn2', unresolved_refs: ['tool0turn9'] },
+    });
+  });
+});
 
 describe('formatAgentMessages with tools parameter', () => {
   it('should process messages normally when tools is not provided', () => {
@@ -540,5 +629,264 @@ describe('formatAgentMessages with tools parameter', () => {
     expect((result.messages[4] as AIMessage).tool_calls?.[0].name).toBe(
       'calculator'
     );
+  });
+
+  describe('restored tool rounds match the live request', () => {
+    const toolCall = (id: string, extra: Record<string, unknown> = {}) => ({
+      type: ContentTypes.TOOL_CALL,
+      tool_call: { id, name: 'lookup', args: '{}', output: 'ok', ...extra },
+    });
+
+    it('keeps sequential rounds as separate assistant messages', () => {
+      const payload: TPayload = [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          content: [
+            toolCall('a', { roundId: 'r1' }),
+            toolCall('b', { roundId: 'r1' }),
+            toolCall('c', { roundId: 'r2' }),
+          ],
+        },
+      ];
+
+      const { messages } = formatAgentMessages(payload);
+      const rounds = messages.filter(
+        (m) => m instanceof AIMessage
+      ) as AIMessage[];
+
+      expect(rounds.map((m) => m.tool_calls?.map((c) => c.id))).toEqual([
+        ['a', 'b'],
+        ['c'],
+      ]);
+    });
+
+    it('puts stored Responses items back on the assistant message', () => {
+      const items = [
+        { id: 'rs_1', type: 'reasoning', summary: [] },
+        {
+          id: 'fc_1',
+          type: 'function_call',
+          status: 'completed',
+          arguments: '{}',
+          call_id: 'a',
+          name: 'lookup',
+        },
+      ];
+      const payload: TPayload = [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          content: [
+            toolCall('a', {
+              providerItems: { origin: 'o', created_at: 1, items },
+            }),
+          ],
+        },
+      ];
+
+      const { messages } = formatAgentMessages(payload);
+      const round = messages.find((m) => m instanceof AIMessage) as AIMessage;
+
+      expect(round.response_metadata.output).toEqual(items);
+      expect(round.tool_calls).toHaveLength(1);
+    });
+
+    it('replays a stored call in the form its part carries', () => {
+      const call = (name: string, args: string) => ({
+        id: 'fc_1',
+        type: 'function_call',
+        status: 'completed',
+        arguments: args,
+        call_id: 'a',
+        name,
+      });
+      const payload: TPayload = [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          content: [
+            toolCall('a', {
+              name: 'wrapper',
+              args: '{"name":"lookup"}',
+              providerItems: {
+                origin: 'o',
+                created_at: 1,
+                items: [call('lookup', '{}')],
+              },
+            }),
+          ],
+        },
+      ];
+
+      const { messages } = formatAgentMessages(payload);
+      const round = messages.find((m) => m instanceof AIMessage) as AIMessage;
+
+      expect(round.response_metadata.output).toEqual([
+        call('wrapper', '{"name":"lookup"}'),
+      ]);
+    });
+
+    it('keeps the stored call when the part args did not survive storage', () => {
+      const item = {
+        id: 'fc_1',
+        type: 'function_call',
+        status: 'completed',
+        arguments: '{}',
+        call_id: 'a',
+        name: 'lookup',
+      };
+      const payload: TPayload = [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          content: [
+            toolCall('a', {
+              name: 'wrapper',
+              args: '{"name":"look',
+              providerItems: { origin: 'o', created_at: 1, items: [item] },
+            }),
+          ],
+        },
+      ];
+
+      const { messages } = formatAgentMessages(payload);
+      const round = messages.find((m) => m instanceof AIMessage) as AIMessage;
+
+      expect(round.response_metadata.output).toEqual([item]);
+    });
+
+    it('restores no items when one call carries more than the size cap', () => {
+      const item = (callId: string, reasoning: string) => [
+        {
+          id: `rs_${callId}`,
+          type: 'reasoning',
+          summary: [],
+          encrypted_content: reasoning,
+        },
+        {
+          id: `fc_${callId}`,
+          type: 'function_call',
+          status: 'completed',
+          arguments: '{}',
+          call_id: callId,
+          name: 'lookup',
+        },
+      ];
+      const payload: TPayload = [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          content: [
+            toolCall('a', {
+              roundId: 'r1',
+              providerItems: { origin: 'o', items: item('a', 'ENC') },
+            }),
+            toolCall('b', {
+              roundId: 'r1',
+              providerItems: {
+                origin: 'o',
+                items: item('b', 'x'.repeat(512_000)),
+              },
+            }),
+          ],
+        },
+      ];
+
+      const { messages } = formatAgentMessages(payload);
+      const round = messages.find((m) => m instanceof AIMessage) as AIMessage;
+
+      expect(round.tool_calls).toHaveLength(2);
+      expect(round.response_metadata.output).toBeUndefined();
+    });
+
+    it('parses stored content blocks back into blocks', () => {
+      const blocks = [{ type: 'text', text: 'one' }];
+      const payload: TPayload = [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          content: [
+            toolCall('a', {
+              output: JSON.stringify(blocks),
+              outputFormat: 'blocks',
+            }),
+          ],
+        },
+      ];
+
+      const { messages } = formatAgentMessages(payload);
+      const result = messages.find((m) => m instanceof ToolMessage);
+
+      expect(result?.content).toEqual(blocks);
+    });
+  });
+
+  describe('Responses replay gate', () => {
+    const now = 1_000 + 31 * 24 * 60 * 60;
+    const output = [
+      { id: 'rs_ref', type: 'reasoning', summary: [] },
+      { id: 'rs_enc', type: 'reasoning', summary: [], encrypted_content: 'E' },
+      {
+        id: 'fc_1',
+        type: 'function_call',
+        status: 'completed',
+        arguments: '{}',
+        call_id: 'call_1',
+        name: 'lookup',
+      },
+    ];
+    const toolRound = (createdAt: number): AIMessage =>
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'call_1', name: 'lookup', args: {} }],
+        response_metadata: {
+          output,
+          created_at: createdAt,
+          [OPENAI_RESPONSES_ORIGIN_KEY]: 'origin-a',
+        },
+      });
+    const gate = (
+      message: AIMessage,
+      options: { origin?: string; zdr?: boolean; at?: number } = {}
+    ): AIMessage =>
+      gateResponsesProviderOutput(
+        [message],
+        options.origin ?? 'origin-a',
+        options.zdr ?? false,
+        options.at ?? now
+      )[0] as AIMessage;
+    const outputIds = (message: AIMessage): unknown =>
+      (message.response_metadata.output as Array<{ id: string }> | undefined)?.map(
+        (item) => item.id
+      );
+
+    it('keeps the output for its origin and drops it for another origin or under ZDR', () => {
+      const own = toolRound(now);
+      expect(gate(own)).toBe(own);
+
+      for (const gated of [
+        gate(toolRound(now), { origin: 'origin-b' }),
+        gate(toolRound(now), { zdr: true }),
+      ]) {
+        expect(gated.response_metadata.output).toBeUndefined();
+        expect(
+          gated.response_metadata[OPENAI_RESPONSES_ORIGIN_KEY]
+        ).toBeUndefined();
+        expect(gated.tool_calls).toHaveLength(1);
+        expect(gated.content).toEqual([]);
+      }
+    });
+
+    it('drops reasoning references older than 29 days and keeps encrypted ones', () => {
+      const limit = 29 * 24 * 60 * 60;
+
+      expect(outputIds(gate(toolRound(1_000), { at: 1_000 + limit }))).toEqual(
+        ['rs_ref', 'rs_enc', 'fc_1']
+      );
+      expect(
+        outputIds(gate(toolRound(1_000), { at: 1_000 + limit + 1 }))
+      ).toEqual(['rs_enc', 'fc_1']);
+    });
   });
 });
