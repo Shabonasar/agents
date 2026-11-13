@@ -1055,10 +1055,10 @@ export class AgentContext {
      * the history, as for Anthropic.
      */
     const bedrockCache = this.hasBedrockPromptCache();
+    // Moved also without stable instructions: per-turn text left in the system
+    // message would sit ahead of the history and invalidate it on every turn.
     const shouldMoveDynamicInstructions =
-      (promptCacheProvider != null || bedrockCache) &&
-      (stableInstructions !== '' || conversationInstructions !== '') &&
-      dynamicInstructions !== '';
+      (promptCacheProvider != null || bedrockCache) && dynamicInstructions !== '';
     const movedBedrockTail = bedrockCache && shouldMoveDynamicInstructions;
     const buildSystem = (markConversation: boolean): SystemMessage | undefined =>
       this.buildSystemMessage({
@@ -1345,21 +1345,17 @@ export class AgentContext {
     shouldMoveDynamicInstructions: boolean;
     markConversation: boolean;
   }): SystemMessage | undefined {
-    if (!stableInstructions && !conversationInstructions && !dynamicInstructions) {
+    if (
+      !stableInstructions &&
+      !conversationInstructions &&
+      (!dynamicInstructions || shouldMoveDynamicInstructions)
+    ) {
       return undefined;
     }
 
     const systemDynamic = shouldMoveDynamicInstructions
       ? ''
       : dynamicInstructions;
-
-    if (
-      promptCacheProvider === Providers.OPENROUTER &&
-      !stableInstructions &&
-      !conversationInstructions
-    ) {
-      return new SystemMessage(dynamicInstructions);
-    }
 
     if (promptCacheProvider != null) {
       const cacheControl = buildAnthropicCacheControl(
