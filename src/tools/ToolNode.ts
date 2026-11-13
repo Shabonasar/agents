@@ -121,6 +121,7 @@ import {
 } from '@/langfuseRuntimeScope';
 import {
   buildReferenceKey,
+  buildCompletionRefFields,
   ToolOutputReferenceRegistry,
 } from '@/tools/toolOutputReferences';
 import {
@@ -1979,9 +1980,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
      * on a shared turn field.
      */
     const refKey =
-      registry != null && batchIndex != null && turn != null
-        ? buildReferenceKey(batchIndex, turn)
-        : undefined;
+      registry != null ? this.getReferenceKey(batchIndex, turn) : undefined;
     /**
      * Hoisted outside the try so the catch branch can append
      * `[unresolved refs: …]` to error messages — otherwise the LLM
@@ -3255,6 +3254,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     });
   }
 
+  private getReferenceKey(
+    batchIndex: number | undefined,
+    turn: number | undefined
+  ): string | undefined {
+    return batchIndex != null && turn != null
+      ? buildReferenceKey(batchIndex, turn)
+      : undefined;
+  }
+
   /**
    * Registers the full, raw output under `refKey` (when provided) and
    * builds the per-message ref metadata stamped onto the resulting
@@ -3582,6 +3590,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         ),
         name: call.name,
         id: toolCallId,
+        ...buildCompletionRefFields(
+          toolMessage.additional_kwargs as t.ToolMessageRefMetadata
+        ),
         output: contentString,
         progress: 1,
         ...(outcome != null && { outcome }),
@@ -4511,8 +4522,23 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }
         earlyCompletionDispatchedIds.add(result.toolCallId);
         receivedAtById.set(result.toolCallId, receivedAt);
+        const earlyRefMeta: t.ToolMessageRefMetadata = {
+          _refKey:
+            result.status === 'error' || this.toolOutputRegistry == null
+              ? undefined
+              : this.getReferenceKey(
+                batchIndexByCallId.get(result.toolCallId),
+                turn
+              ),
+          _unresolvedRefs: unresolvedByCallId.get(result.toolCallId),
+        };
         earlyCompletionDispatches.push(
-          this.dispatchEarlyToolCompletion({ ...result, received_at: receivedAt }, request, config).then(
+          this.dispatchEarlyToolCompletion(
+            { ...result, received_at: receivedAt },
+            request,
+            config,
+            earlyRefMeta
+          ).then(
             (dispatched) => {
               if (!dispatched) {
                 earlyCompletionDispatchedIds.delete(result.toolCallId);
@@ -4772,10 +4798,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         } else {
           const batchIndex = batchIndexByCallId.get(result.toolCallId);
           const refKey =
-            this.toolOutputRegistry != null &&
-            batchIndex != null &&
-            turn != null
-              ? buildReferenceKey(batchIndex, turn)
+            this.toolOutputRegistry != null
+              ? this.getReferenceKey(batchIndex, turn)
               : undefined;
           let serialized = serializeToolOutputWithinLimits(
             result.content,
@@ -4855,8 +4879,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           });
         }
 
+        const refMeta =
+          toolMessage.additional_kwargs as t.ToolMessageRefMetadata;
+        /**
+         * The stream emits an eager completion before ToolNode claims the
+         * batch turn, so it cannot carry the reference key; re-emit with it
+         * (same as the hook-rewrite case above) so the key is persisted.
+         */
         if (
-          !eagerCompletionDispatchedIds.has(result.toolCallId) &&
+          (!eagerCompletionDispatchedIds.has(result.toolCallId) ||
+            Object.keys(buildCompletionRefFields(refMeta)).length > 0) &&
           !earlyCompletionDispatchedIds.has(result.toolCallId)
         ) {
           await this.dispatchStepCompleted(
@@ -4869,7 +4901,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             resolveToolOutcome(request?.args, outcomeFieldsFromResult(result), {
               isError: result.status === 'error',
             }),
-            receivedAtById.get(result.toolCallId) ?? result.received_at
+            receivedAtById.get(result.toolCallId) ?? result.received_at,
+            refMeta
           );
         }
 
@@ -5172,7 +5205,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     config: RunnableConfig,
     turn?: number,
     outcome?: string,
-    receivedAt?: number
+    receivedAt?: number,
+    refMeta?: t.ToolMessageRefMetadata
   ): Promise<boolean> {
     const stepId = this.toolCallStepIds?.get(toolCallId) ?? '';
     if (!stepId) {
@@ -5195,6 +5229,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             args: serializeToolContentBounded(args, this.maxToolResultChars),
             name: toolName,
             id: toolCallId,
+            ...buildCompletionRefFields(refMeta),
             output,
             progress: 1,
             ...(outcome != null && { outcome }),
@@ -5217,7 +5252,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private async dispatchEarlyToolCompletion(
     result: t.ToolExecuteResult,
     request: t.ToolCallRequest,
-    config: RunnableConfig
+    config: RunnableConfig,
+    refMeta?: t.ToolMessageRefMetadata
   ): Promise<boolean> {
     const output =
       result.status === 'error'
@@ -5240,7 +5276,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       resolveToolOutcome(request.args, outcomeFieldsFromResult(result), {
         isError: result.status === 'error',
       }),
-      result.received_at
+      result.received_at,
+      refMeta
     );
   }
 
