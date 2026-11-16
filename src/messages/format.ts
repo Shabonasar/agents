@@ -402,6 +402,9 @@ interface FormatAssistantMessageOptions {
   preserveReasoningContent?: boolean;
   preserveTextContent?: boolean;
   provider?: ProviderName;
+  replayProviderReasoning?: ReplayProviderReasoning;
+  /** Source part index up to which reasoning is not replayed (a summary sits there). */
+  replayAfterSourceIndex?: number;
   retainedSourceContentEnd?: number;
   sourceMessageId?: string;
   sourceContentPartOffset?: number;
@@ -411,8 +414,21 @@ interface FormatAssistantMessageOptions {
 
 type SourceContentPartIndices = number | readonly number[];
 
+/** Identity of the model a restored history is about to be sent to. */
+export interface ReplayProviderReasoning {
+  provider: ProviderName;
+  model: string;
+}
+
 export interface FormatAgentMessagesOptions {
   provider?: ProviderName;
+  /** Opt-in: puts signed Anthropic / Bedrock reasoning blocks stored on `THINK`
+   *  parts (`provider_replay`) back at the position of their part, so the
+   *  restored request carries the same blocks the live request of that turn
+   *  did. Applied only when `provider` and `model` equal the identity that
+   *  produced the blocks; anything else is dropped as before. Without this
+   *  option `provider_replay` is ignored. */
+  replayProviderReasoning?: ReplayProviderReasoning;
   /** Emit flattenable text content as the joined string the legacy-content
    *  projection would produce, so the per-request `formatContentStrings` pass
    *  finds nothing to convert and every history message keeps its identity —
@@ -473,6 +489,68 @@ function extractReasoningContent(
     return typeof reasoningText.text === 'string' ? reasoningText.text : '';
   }
   return '';
+}
+
+/**
+ * Replayed blocks of a `THINK` part, in stored order, when they were produced
+ * by the exact provider and model the history is restored for.
+ */
+function getReplayBlocks(
+  part: MessageContentComplex | undefined | null,
+  target: ReplayProviderReasoning | undefined
+): MessageContentComplex[] {
+  const replay = (part as ReasoningContentText | undefined | null)
+    ?.provider_replay;
+  if (target == null || part?.type !== ContentTypes.THINK || replay == null) {
+    return [];
+  }
+  if (target.provider === Providers.ANTHROPIC) {
+    return replay.anthropic?.model !== target.model
+      ? []
+      : replay.anthropic.blocks.flatMap((block): MessageContentComplex[] => {
+        if (block.type === 'redacted_thinking') {
+          return block.data !== ''
+            ? [{ type: 'redacted_thinking', data: block.data }]
+            : [];
+        }
+        return block.signature != null && block.signature !== ''
+          ? [
+            {
+              type: ContentTypes.THINKING,
+              thinking: block.thinking ?? '',
+              signature: block.signature,
+            },
+          ]
+          : [];
+      });
+  }
+  if (target.provider === Providers.BEDROCK) {
+    return replay.bedrock?.model !== target.model
+      ? []
+      : replay.bedrock.blocks.flatMap((block): MessageContentComplex[] => {
+        const { reasoningText, redactedContent } = block;
+        if (
+          reasoningText?.text != null &&
+          reasoningText.text !== '' &&
+          reasoningText.signature != null &&
+          reasoningText.signature !== ''
+        ) {
+          return [
+            {
+              type: ContentTypes.REASONING_CONTENT,
+              reasoningText: {
+                text: reasoningText.text,
+                signature: reasoningText.signature,
+              },
+            },
+          ];
+        }
+        return redactedContent != null && redactedContent !== ''
+          ? [{ type: ContentTypes.REASONING_CONTENT, redactedContent }]
+          : [];
+      });
+  }
+  return [];
 }
 
 type ServerToolInput = Exclude<NonNullable<ToolCallPart['args']>, string>;
@@ -1742,6 +1820,22 @@ function formatAssistantMessage(
     );
   };
 
+  const replayBlockSet = new WeakSet<object>();
+  const attachPendingReplayBlocks = (aiMessage: AIMessage): void => {
+    const moved = currentContent.filter((item) => replayBlockSet.has(item));
+    if (moved.length === 0) {
+      return;
+    }
+    currentContent = currentContent.filter((item) => !replayBlockSet.has(item));
+    let existing: MessageContentComplex[] = [];
+    if (typeof aiMessage.content !== 'string') {
+      existing = aiMessage.content as MessageContentComplex[];
+    } else if (aiMessage.content !== '') {
+      existing = [{ type: ContentTypes.TEXT, text: aiMessage.content }];
+    }
+    aiMessage.content = toLangChainContent([...existing, ...moved]);
+  };
+
   const flushPendingServerToolUse = (toolUseId: string): void => {
     for (const [id, pending] of pendingServerToolUses) {
       pendingServerToolUses.delete(id);
@@ -1996,6 +2090,7 @@ function formatAssistantMessage(
         } else {
           attachPendingReasoningContent(lastAIMessage);
           appendSourcePartIndices(lastAIMessage, 'model', sourcePartIndices);
+          attachPendingReplayBlocks(lastAIMessage);
         }
 
         const tool_call: ToolCallPart = _tool_call;
@@ -2096,6 +2191,18 @@ function formatAssistantMessage(
           pendingReasoningSourcePartIndices,
           sourcePartIndices
         );
+        const replayBlocks =
+          Math.min(...[sourcePartIndices].flat()) >
+          (options?.replayAfterSourceIndex ?? -1)
+            ? getReplayBlocks(part, options?.replayProviderReasoning)
+            : [];
+        if (replayBlocks.length > 0) {
+          for (const block of replayBlocks) {
+            replayBlockSet.add(block);
+          }
+          currentContent.push(...replayBlocks);
+          appendCurrentContentProvenance(sourcePartIndices, 'model', true);
+        }
         continue;
       } else if (part.type === ContentTypes.STEER) {
         /*
@@ -2615,6 +2722,9 @@ type SummaryBoundary =
   | {
       mode: 'coverage';
       messageIndex: number;
+      /** Message and part that carry the summary. */
+      carrierIndex: number;
+      carrierContentIndex: number;
       text: string;
       tokenCount: number;
     }
@@ -2716,6 +2826,8 @@ function scanSummaryBlocks(payload: TPayload): SummaryScan {
           ? {
             mode: 'coverage',
             messageIndex: retainedIndex,
+            carrierIndex: i,
+            carrierContentIndex: j,
             text: summaryText,
             tokenCount,
           }
@@ -2868,6 +2980,53 @@ function isSdkManagedToolName(name: unknown): name is string {
   );
 }
 
+/** Where signed reasoning may be replayed from: a payload index, and in that
+ *  message only the parts after `afterContentIndex` (-1 admits every part). */
+interface ReplayStart {
+  messageIndex: number;
+  afterContentIndex: number;
+}
+
+/**
+ * First payload position whose signed reasoning may be replayed. A thinking
+ * block is bound to everything before it, so an assistant message whose
+ * reasoning cannot be replayed (not stored, edited away, another model)
+ * invalidates every later block: replay starts after the last such message.
+ * A summary replaced the content before it, so the chain starts again after
+ * the part that carries it.
+ */
+function findReplayStart(
+  payload: TPayload,
+  target: ReplayProviderReasoning,
+  summaryBoundary: SummaryBoundary | undefined
+): ReplayStart {
+  const [carrierIndex, carrierContentIndex] =
+    summaryBoundary?.mode === 'coverage'
+      ? [summaryBoundary.carrierIndex, summaryBoundary.carrierContentIndex]
+      : [summaryBoundary?.messageIndex ?? 0, summaryBoundary?.contentIndex ?? -1];
+  let start = carrierIndex;
+  for (let i = carrierIndex; i < payload.length; i++) {
+    const message = payload[i];
+    const after = i === carrierIndex ? carrierContentIndex : -1;
+    if (
+      message.role === 'assistant' &&
+      Array.isArray(message.content) &&
+      message.content.some(
+        (part, index) =>
+          index > after &&
+          part.type === ContentTypes.THINK &&
+          getReplayBlocks(part, target).length === 0
+      )
+    ) {
+      start = i + 1;
+    }
+  }
+  return {
+    messageIndex: start,
+    afterContentIndex: start === carrierIndex ? carrierContentIndex : -1,
+  };
+}
+
 /**
  * Formats an array of messages for LangChain, handling tool calls and creating ToolMessage instances.
  *
@@ -2970,7 +3129,12 @@ export const formatAgentMessages = (
   let boundaryTokenAdjustment: SummaryTokenAdjustment | undefined;
   // Keep track of the mapping from original payload indices to result indices
   const indexMapping: Record<number, number[] | undefined> = {};
+  const invalidatedReplayTokenCounts = new Set<number>();
   const { boundary: summaryBoundary } = scanSummaryBlocks(payload);
+  const replayStart =
+    options?.replayProviderReasoning != null
+      ? findReplayStart(payload, options.replayProviderReasoning, summaryBoundary)
+      : { messageIndex: 0, afterContentIndex: -1 };
 
   // Summary metadata is returned to the caller so it can be forwarded to the
   // agent run and included in the single system message via AgentContext.
@@ -3194,7 +3358,7 @@ export const formatAgentMessages = (
       }
     }
 
-    const formattedMessages = formatAssistantMessage(processedMessage, {
+    const assistantFormatOptions: FormatAssistantMessageOptions = {
       compactionSemanticIndex: compactionSemanticIndexCollector,
       intentToolNames: options?.compactionSemanticIndex?.intentToolNames,
       preserveUnpairedServerToolUses: i === payload.length - 1,
@@ -3210,7 +3374,29 @@ export const formatAgentMessages = (
       sourceContentPartOffset,
       sourceContentPartIndices: processedSourceContentPartIndices,
       toolSourceContentPartIndices: processedToolSourceContentPartIndices,
-    });
+      replayProviderReasoning:
+        i >= replayStart.messageIndex
+          ? options?.replayProviderReasoning
+          : undefined,
+      replayAfterSourceIndex:
+        i === replayStart.messageIndex
+          ? replayStart.afterContentIndex
+          : undefined,
+    };
+    if (
+      Array.isArray(processedMessage.content) &&
+      processedMessage.content.some(
+        (part) =>
+          getReplayBlocks(part, assistantFormatOptions.replayProviderReasoning)
+            .length > 0
+      )
+    ) {
+      invalidatedReplayTokenCounts.add(i);
+    }
+    const formattedMessages = formatAssistantMessage(
+      processedMessage,
+      assistantFormatOptions
+    );
     /**
      * A steer that ends an assistant message leaves the replay on a
      * `HumanMessage`. The next payload message is itself a user turn, so the
@@ -3302,7 +3488,10 @@ export const formatAgentMessages = (
       const resultIndices = indexMapping[originalIndex] || [];
       let tokenCount = indexTokenCountMap[originalIndex];
 
-      if (tokenCount === undefined) {
+      if (
+        tokenCount === undefined ||
+        invalidatedReplayTokenCounts.has(originalIndex)
+      ) {
         continue;
       }
 
