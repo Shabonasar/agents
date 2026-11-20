@@ -869,6 +869,64 @@ describe('StandardGraph final response reasoning fallback', () => {
     ]);
   });
 
+  it('keeps reasoning that resumes after text in a part of its own when replaying provider reasoning', async () => {
+    const streamParts = async (
+      providerReasoningReplay: boolean
+    ): Promise<t.MessageContentComplex[]> => {
+      const { contentParts, aggregateContent } = createContentAggregator();
+      const run = await Run.create<t.IState>({
+        runId: `reasoning-resumes-${providerReasoningReplay}`,
+        graphConfig: {
+          type: 'standard',
+          llmConfig: {
+            provider: Providers.ANTHROPIC,
+            model: 'claude-test',
+            apiKey: 'test-key',
+            streamUsage: false,
+          },
+          providerReasoningReplay,
+        },
+        returnContent: true,
+        skipCleanup: true,
+        customHandlers: createReasoningHandlers(aggregateContent, []),
+      });
+      if (!run.Graph) {
+        throw new Error('Expected graph to be initialized');
+      }
+      run.Graph.overrideModel = new StreamingReasoningModel([
+        new AIMessageChunk({
+          content: [{ type: ContentTypes.THINKING, thinking: 'first' }],
+        }),
+        new AIMessageChunk({ content: 'checking' }),
+        new AIMessageChunk({
+          content: [{ type: ContentTypes.THINKING, thinking: 'second' }],
+        }),
+        new AIMessageChunk({ content: 'done' }),
+      ]);
+      await run.processStream(
+        { messages: [new HumanMessage('think twice')] },
+        {
+          ...config,
+          configurable: { thread_id: `reasoning-resumes-${providerReasoningReplay}` },
+        }
+      );
+      return contentParts as t.MessageContentComplex[];
+    };
+
+    const types = (parts: t.MessageContentComplex[]): string[] =>
+      parts.map((part) => part.type as string);
+
+    expect(types(await streamParts(true))).toEqual([
+      ContentTypes.THINK,
+      ContentTypes.TEXT,
+      ContentTypes.THINK,
+      ContentTypes.TEXT,
+    ]);
+    expect(
+      types(await streamParts(false)).filter((type) => type === ContentTypes.THINK)
+    ).toHaveLength(1);
+  });
+
   it('does not replay streamed OpenRouter text when the final chunk has reasoning_details', async () => {
     const text = '391.';
     const reasoningText = '17 times 23 equals 391.';

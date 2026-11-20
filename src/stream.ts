@@ -33,6 +33,7 @@ import {
   CODE_EXECUTION_TOOLS,
   LOCAL_CODING_BUNDLE_NAMES,
 } from '@/common';
+import { resolveClientOptionsModel } from '@/llm/request';
 import {
   getMessageCreationContentMetadata,
   splitAssistantTextContentByPhase,
@@ -480,6 +481,17 @@ function isGoogleServerSideToolContentPart(
   return contentPart.type === 'toolCall' || contentPart.type === 'toolResponse';
 }
 
+function isReasoningContentPart(
+  contentPart: t.MessageContentComplex
+): boolean {
+  return (
+    (contentPart.type?.startsWith(ContentTypes.THINKING) ?? false) ||
+    (contentPart.type?.startsWith(ContentTypes.REASONING) ?? false) ||
+    (contentPart.type?.startsWith(ContentTypes.REASONING_CONTENT) ?? false) ||
+    contentPart.type === 'redacted_thinking'
+  );
+}
+
 function isTextContentPart(contentPart: t.MessageContentComplex): boolean {
   return contentPart.type?.startsWith(ContentTypes.TEXT) ?? false;
 }
@@ -494,6 +506,89 @@ function getReasoningTextFromContentPart(
       ?.text ??
     ''
   );
+}
+
+interface SignedReasoningPart {
+  type?: string;
+  thinking?: string;
+  reasoning?: string;
+  signature?: string;
+  data?: string;
+  reasoningText?: { text?: string; signature?: string };
+  redactedContent?: string;
+}
+
+/** The signed blocks a streamed reasoning part carries, tagged with the model that served the call. */
+function getReasoningReplay(
+  contentPart: t.MessageContentComplex,
+  model: string | undefined
+): t.ProviderReasoningReplay | undefined {
+  const part = contentPart as SignedReasoningPart;
+  if (model == null || model === '') {
+    return undefined;
+  }
+  const hasSignature = typeof part.signature === 'string';
+  if (
+    part.type === ContentTypes.THINKING ||
+    (part.type === ContentTypes.REASONING && hasSignature)
+  ) {
+    const thinking =
+      part.type === ContentTypes.THINKING ? part.thinking : part.reasoning;
+    if (typeof thinking !== 'string' && !hasSignature) {
+      return undefined;
+    }
+    return {
+      anthropic: {
+        model,
+        blocks: [
+          {
+            type: ContentTypes.THINKING,
+            ...(typeof thinking === 'string' && { thinking }),
+            ...(hasSignature && { signature: part.signature }),
+          },
+        ],
+      },
+    };
+  }
+  if (part.type === 'redacted_thinking' && part.data != null && part.data !== '') {
+    return {
+      anthropic: { model, blocks: [{ type: 'redacted_thinking', data: part.data }] },
+    };
+  }
+  if (part.type !== ContentTypes.REASONING_CONTENT) {
+    return undefined;
+  }
+  const { text, signature } = part.reasoningText ?? {};
+  if (typeof text === 'string' || typeof signature === 'string') {
+    return {
+      bedrock: {
+        model,
+        blocks: [
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            reasoningText: {
+              ...(typeof text === 'string' && { text }),
+              ...(typeof signature === 'string' && { signature }),
+            },
+          },
+        ],
+      },
+    };
+  }
+  if (part.redactedContent != null && part.redactedContent !== '') {
+    return {
+      bedrock: {
+        model,
+        blocks: [
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            redactedContent: part.redactedContent,
+          },
+        ],
+      },
+    };
+  }
+  return undefined;
 }
 
 function getReasoningTextFromChunk(
@@ -1468,6 +1563,15 @@ export function getChunkContent({
   }
 
   if (
+    provider === Providers.BEDROCK &&
+    Array.isArray(chunk?.content) &&
+    chunk.content.length > 0 &&
+    chunk.content.every((contentPart) => isReasoningContentPart(contentPart))
+  ) {
+    return chunk.content;
+  }
+
+  if (
     (provider === Providers.OPENAI || provider === Providers.AZURE) &&
     (
       chunk?.additional_kwargs?.reasoning as
@@ -2207,18 +2311,31 @@ hasToolCallChunks: ${hasToolCallChunks}
         metadata
       );
     } else if (content.every((c) => isReasoningContentBlock(c))) {
+      const invokedModel = metadata?.[Constants.INVOKED_MODEL];
+      const servingModel =
+        typeof invokedModel === 'string' && invokedModel !== ''
+          ? invokedModel
+          : resolveClientOptionsModel(agentContext.clientOptions);
       await graph.dispatchReasoningDelta(
         stepId,
         {
-          content: content.map((c) => ({
-            type: ContentTypes.THINK,
-            think:
-              (c as t.ThinkingContentText).thinking ??
-              (c as Partial<t.GoogleReasoningContentText>).reasoning ??
-              (c as Partial<t.BedrockReasoningContentText>).reasoningText
-                ?.text ??
-              '',
-          })),
+          content: content.map((c) => {
+            const providerReplay = agentContext.providerReasoningReplay
+              ? getReasoningReplay(c, servingModel)
+              : undefined;
+            return {
+              type: ContentTypes.THINK,
+              think:
+                (c as t.ThinkingContentText).thinking ??
+                (c as Partial<t.GoogleReasoningContentText>).reasoning ??
+                (c as Partial<t.BedrockReasoningContentText>).reasoningText
+                  ?.text ??
+                '',
+              ...(providerReplay != null && {
+                provider_replay: providerReplay,
+              }),
+            };
+          }),
         },
         metadata
       );
@@ -2310,6 +2427,78 @@ hasToolCallChunks: ${hasToolCallChunks}
     }
     agentContext.lastToken = chunk.content;
   }
+}
+
+type SignedText = Record<string, string | undefined>;
+
+function appendReplayBlock<B extends object>(
+  blocks: B[],
+  incoming: B,
+  signedText: (block: B) => SignedText | undefined,
+  textKey: 'thinking' | 'text'
+): void {
+  const next = signedText(incoming);
+  const current =
+    blocks.length > 0 ? signedText(blocks[blocks.length - 1]) : undefined;
+  // A signature closes its block, so later text or a signature of its own starts the next one
+  const startsNewBlock =
+    current?.signature != null &&
+    current.signature !== '' &&
+    (typeof next?.[textKey] === 'string' ||
+      (next?.signature != null && next.signature !== ''));
+  if (next == null || current == null || startsNewBlock) {
+    blocks.push(structuredClone(incoming));
+    return;
+  }
+  for (const key of [textKey, 'signature']) {
+    if (typeof next[key] === 'string') {
+      current[key] = (current[key] ?? '') + next[key];
+    }
+  }
+}
+
+function mergeReplayBlocks<B extends object>(
+  existing: { model: string; blocks: B[] } | undefined,
+  incoming: { model: string; blocks: B[] } | undefined,
+  signedText: (block: B) => SignedText | undefined,
+  textKey: 'thinking' | 'text'
+): { model: string; blocks: B[] } | undefined {
+  if (incoming == null) {
+    return existing;
+  }
+  const merged =
+    existing?.model === incoming.model
+      ? structuredClone(existing)
+      : { model: incoming.model, blocks: [] as B[] };
+  for (const block of incoming.blocks) {
+    appendReplayBlock(merged.blocks, block, signedText, textKey);
+  }
+  return merged;
+}
+
+function mergeProviderReasoningReplay(
+  existing: t.ProviderReasoningReplay | undefined,
+  incoming: t.ProviderReasoningReplay | undefined
+): t.ProviderReasoningReplay | undefined {
+  if (incoming == null) {
+    return existing;
+  }
+  const anthropic = mergeReplayBlocks(
+    existing?.anthropic,
+    incoming.anthropic,
+    (block) => (block.type === ContentTypes.THINKING ? block : undefined),
+    'thinking'
+  );
+  const bedrock = mergeReplayBlocks(
+    existing?.bedrock,
+    incoming.bedrock,
+    (block) => block.reasoningText,
+    'text'
+  );
+  return {
+    ...(anthropic != null && { anthropic }),
+    ...(bedrock != null && { bedrock }),
+  };
 }
 
 export function createContentAggregator(): t.ContentAggregatorResult {
@@ -2548,9 +2737,14 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       typeof contentPart.think === 'string'
     ) {
       const currentContent = contentParts[index] as t.ReasoningDeltaUpdate;
+      const providerReplay = mergeProviderReasoningReplay(
+        currentContent.provider_replay,
+        (contentPart as t.ReasoningContentText).provider_replay
+      );
       const update: t.ReasoningDeltaUpdate = {
         type: ContentTypes.THINK,
         think: (currentContent.think || '') + contentPart.think,
+        ...(providerReplay != null && { provider_replay: providerReplay }),
       };
       contentParts[index] = update;
     } else if (

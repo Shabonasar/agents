@@ -180,6 +180,7 @@ import {
 } from '@/messages/reducer';
 import {
   isThinkingEnabled,
+  resolveClientOptionsModel,
   getConfiguredCompletionTokens,
 } from '@/llm/request';
 import { createToolHistoryPreparation } from '@/messages/toolHistoryProjection';
@@ -206,6 +207,7 @@ import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { handoffStateAnnotation } from './handoff';
 import { handleToolCalls } from '@/tools/handlers';
+import { stripSignedReasoning } from '@/llm/bedrock/reasoningRetry';
 import { resolveMaxSeals } from '@/llm/preempt';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
@@ -2662,7 +2664,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       agentContext.currentTokenType === ContentTypes.THINK ||
       agentContext.currentTokenType === 'think_and_text'
     ) {
-      keyList.push('reasoning');
+      // Reasoning resumed after text keeps its own part, so replayed blocks stay in order
+      keyList.push(
+        agentContext.providerReasoningReplay &&
+          agentContext.reasoningTransitionCount > 0
+          ? `reasoning-${agentContext.reasoningTransitionCount}`
+          : 'reasoning'
+      );
     } else if (agentContext.tokenTypeSwitch === 'content') {
       keyList.push(`post-reasoning-${agentContext.reasoningTransitionCount}`);
     }
@@ -4779,12 +4787,26 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                       contextBudget: fallbackContextBudget,
                       forceRawRecount: true,
                     });
+                  /** Restored signed reasoning is bound to the primary model. */
+                  const replaySafeMessages =
+                    agentContext.providerReasoningReplay &&
+                    (fallbackProvider !== agentContext.provider ||
+                      resolveClientOptionsModel(fallbackClientOptions) !==
+                        resolveClientOptionsModel(agentContext.clientOptions))
+                      ? trackProviderMessageOrigins(
+                        fallbackMessages,
+                        stripSignedReasoning(
+                          fallbackMessages,
+                          agentContext.provider
+                        )
+                      )
+                      : fallbackMessages;
                   const source = agentContext.useLegacyContent
                     ? trackProviderMessageOrigins(
-                      fallbackMessages,
-                      formatContentStrings(fallbackMessages)
+                      replaySafeMessages,
+                      formatContentStrings(replaySafeMessages)
                     )
-                    : fallbackMessages;
+                    : replaySafeMessages;
                   const boundedSource = trackProviderMessageOrigins(
                     source,
                     projectToolMessagesForProvider(
